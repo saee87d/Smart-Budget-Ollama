@@ -1,0 +1,9 @@
+{
+    "budget": 3000000.0,
+    "targets": [
+        {
+            "subject": "car",
+            "price": 200000.0
+        }
+    ]
+}
