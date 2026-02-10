@@ -1,0 +1,529 @@
+import ollama
+import csv
+import os
+import json
+from collections import defaultdict
+
+# New system prompt (complete based on your rules)
+system_prompt = """
+You are a financial analyst that converts English text related to financial matters into precise, structured numerical outputs.
+
+⚠️ Important: Your output must be only one line. No explanations, no numbering, no additional text should exist.
+
+1. Content Type Recognition (Prioritization)
+Input text may contain one of the following:
+1. Analytical question (query about financial status, goals, transactions)
+2. Financial transaction (expense or income)
+3. Budget / Balance declaration
+4. Financial goal definition
+🔹 Only recognize one of these modes and only produce the output related to that mode.
+🔹 If the text is a question, output should be in the format: query_type = [question type]
+
+2. Types of Analytical Questions
+If the text is a question, specify its type:
+* target_distance → distance to goals
+* expense_by_category → total expenses in a specific category or all categories
+* recent_transactions → display recent transactions
+* income_summary → income summary
+* expense_summary → total expenses summary
+* budget_status → current budget status
+* reset_all → delete all information (if user says: delete all, remove everything, reset, start over)
+
+Output: query_type = [one of the above]
+
+3. Financial Transaction Rules
+3.1 Transaction Type (first number)
+* Spending money → 0
+* Income → 1
+
+3.2 Subtype (second number)
+* If expense:
+  * Restaurant food → 0
+  * Cafe and beverages → 1
+  * Supermarket and groceries → 2
+  * Public transportation → 3
+  * Taxi and ride-share → 4
+  * Gas and parking → 5
+  * Clothing and apparel → 6
+  * Cosmetics and toiletries → 7
+  * Medicine and treatment → 8
+  * Electricity, water, gas bills → 9
+  * Internet and mobile → 10
+  * Entertainment and recreation → 11
+  * Books and education → 12
+  * Gifts → 13
+  * Other expenses → 14
+
+* If income:
+  * Salary and wages → 0
+  * Bonus and tips → 1
+  * Sale of goods → 2
+  * Investment income → 3
+  * Gift received → 4
+  * Loan and borrowing → 5
+  * Refund → 6
+  * Part-time work → 7
+  * Other income → 8
+
+3.3 Amount (third number)
+* Amount in USD (dollars)
+* If foreign currency is mentioned (such as EUR, GBP, etc.):
+  * Extract the currency amount and conversion rate from the text
+  * Convert the final amount to USD
+* If unit is not specified, assume USD
+* Expressions like "thousand", "million", "billion" should be converted to complete numbers
+* Space between words
+3.4 Transaction Output Format
+type.subtype.amount
+
+Examples:
+* 0.0.200 (restaurant food)
+* 0.1.50 (cafe)
+* 1.0.5000 (salary)
+
+4. Budget Rules
+If the text is about balance, budget, current money, the amount of money currently available:
+Output should only be in this format:
+budget = amount
+
+Rules:
+* amount only Latin numerals in USD
+* Without any additional text
+
+5. Financial Goal Rules (Target)
+If the text is about a purchase goal or savings in the future:
+Output should only include two lines:
+target subject = name
+target price = price
+
+Rules:
+* target subject should be a simple, general English name (example: car, phone, house, savings, laptop)
+* target price only Latin numerals in USD
+* Without additional text
+
+6. General Output Rules
+⚠️ These rules are very important:
+* Output must be exactly one line
+* No numbers, no explanations, no additional explanatory text
+* If transaction: only type.subtype.amount
+* If budget: only budget = amount
+* If goal: only two lines target subject and target price
+* If question: only query_type = question_type
+* Only Latin characters and numbers
+* No punctuation at the end, no numbering at the beginning
+
+Correct Examples:
+- Input: "I received my salary today 5000 dollars" → Output: 1.0.5000
+- Input: "Spent 50 dollars at a cafe" → Output: 0.1.50
+- Input: "How far am I from my goals?" → Output: query_type = target_distance
+
+Incorrect Examples (never output like this):
+- 1. type = income (wrong - don't number)
+- Based on input: 1.0.5000 (wrong - don't add explanation)
+- Output: 1.0.5000 (wrong - the word "Output" should not be there)
+"""
+
+# Files
+transactions_file = 'transactions.csv'
+state_file = 'financial_state.json'
+
+# Category names
+expense_categories = {
+    0: 'Restaurant Food',
+    1: 'Cafe & Beverages',
+    2: 'Supermarket & Groceries',
+    3: 'Public Transportation',
+    4: 'Taxi & Ride-share',
+    5: 'Gas & Parking',
+    6: 'Clothing & Apparel',
+    7: 'Cosmetics & Toiletries',
+    8: 'Medicine & Treatment',
+    9: 'Utility Bills',
+    10: 'Internet & Mobile',
+    11: 'Entertainment & Recreation',
+    12: 'Books & Education',
+    13: 'Gifts',
+    14: 'Other Expenses'
+}
+
+income_categories = {
+    0: 'Salary & Wages',
+    1: 'Bonus & Tips',
+    2: 'Sale of Goods',
+    3: 'Investment Income',
+    4: 'Gift Received',
+    5: 'Loan & Borrowing',
+    6: 'Refund',
+    7: 'Part-time Work',
+    8: 'Other Income'
+}
+
+# Create transactions file if it doesn't exist
+if not os.path.exists(transactions_file) or os.path.getsize(transactions_file) == 0:
+    with open(transactions_file, 'w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file, delimiter=',')
+        writer.writerow(['Type', 'Subtype', 'Amount'])
+
+# Load previous state
+current_budget = 0
+targets = []
+
+if os.path.exists(state_file):
+    try:
+        with open(state_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            current_budget = data.get('budget', 0)
+            targets = data.get('targets', [])
+    except:
+        print("Error reading state file. Starting from scratch.")
+
+def save_state():
+    """Save current state"""
+    data = {
+        'budget': current_budget,
+        'targets': targets
+    }
+    with open(state_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+def load_transactions():
+    """Load all transactions from CSV"""
+    transactions = []
+    if os.path.exists(transactions_file):
+        with open(transactions_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                transactions.append({
+                    'type': int(row['Type']),
+                    'subtype': int(row['Subtype']),
+                    'amount': float(row['Amount'])
+                })
+    return transactions
+
+def handle_query(query_type):
+    """Process analytical questions"""
+    
+    global current_budget, targets
+    
+    if query_type == 'reset_all':
+        print("\n⚠️  Are you sure you want to delete all information?")
+        print("   This operation includes:")
+        print("   • All transactions")
+        print("   • Current budget")
+        print("   • All financial goals")
+        confirm = input("\n   Type 'yes' to confirm: ").strip().lower()
+        
+        if confirm in ['yes', 'y']:
+            try:
+                # Delete transactions file
+                if os.path.exists(transactions_file):
+                    os.remove(transactions_file)
+                
+                # Delete state file
+                if os.path.exists(state_file):
+                    os.remove(state_file)
+                
+                # Reset variables
+                current_budget = 0
+                targets = []
+                
+                # Recreate transactions file
+                with open(transactions_file, 'w', newline='', encoding='utf-8') as file:
+                    writer = csv.writer(file, delimiter=',')
+                    writer.writerow(['Type', 'Subtype', 'Amount'])
+                
+                print("\n✅ All information successfully deleted!")
+                print("🔄 System restarted from scratch.\n")
+            except Exception as e:
+                print(f"\n❌ Error deleting information: {e}")
+        else:
+            print("\n🚫 Operation cancelled. Information preserved.")
+        return
+    
+    if query_type == 'target_distance':
+        if not targets:
+            print("❌ No financial goals defined.")
+            return
+        
+        print("\n📊 Distance to Goals:")
+        print(f"💰 Current Budget: ${current_budget:,.2f}\n")
+        
+        for i, target in enumerate(targets, 1):
+            remaining = target['price'] - current_budget
+            percentage = (current_budget / target['price']) * 100 if target['price'] > 0 else 0
+            
+            print(f"{i}. {target['subject']}:")
+            print(f"   🎯 Target Price: ${target['price']:,.2f}")
+            if remaining > 0:
+                print(f"   📉 Remaining: ${remaining:,.2f} ({100-percentage:.1f}% remaining)")
+            else:
+                print(f"   ✅ Goal achieved! (${abs(remaining):,.2f} extra)")
+            print()
+    
+    elif query_type == 'expense_by_category':
+        transactions = load_transactions()
+        expenses = [t for t in transactions if t['type'] == 0]
+        
+        if not expenses:
+            print("❌ No expenses recorded.")
+            return
+        
+        category_totals = defaultdict(float)
+        for exp in expenses:
+            category_totals[exp['subtype']] += exp['amount']
+        
+        total_expenses = sum(category_totals.values())
+        
+        # Display total expenses at the beginning
+        print("\n" + "=" * 70)
+        print(f"💸 Total Expenses: ${total_expenses:,.2f}")
+        print("=" * 70)
+        print(f"💰 Current Balance: ${current_budget:,.2f}")
+        print("=" * 70)
+        print("\n📊 Expenses by Category:\n")
+        
+        # Display all categories (even without expenses)
+        for category_id in sorted(expense_categories.keys()):
+            cat_name = expense_categories[category_id]
+            amount = category_totals.get(category_id, 0)
+            
+            if amount > 0:
+                percentage = (amount / total_expenses) * 100
+                bar_length = int(percentage / 2)  # bar from 50 or less
+                bar = "█" * bar_length + "░" * (50 - bar_length)
+                print(f"{category_id:2d}. {cat_name:25s} │{bar}│ {percentage:6.1f}% │ ${amount:>12,.2f}")
+            else:
+                print(f"{category_id:2d}. {cat_name:25s} │{' ' * 50}│  0.0% │      $0.00")
+        
+        print("\n" + "=" * 70)
+        print(f"💵 Total Expenses: ${total_expenses:,.2f}")
+        print("=" * 70)
+    
+    elif query_type == 'recent_transactions':
+        transactions = load_transactions()
+        
+        if not transactions:
+            print("❌ No transactions recorded.")
+            return
+        
+        # Get last 5 transactions
+        recent = transactions[-5:]
+        
+        print("\n📋 Recent Transactions:")
+        for i, trans in enumerate(reversed(recent), 1):
+            trans_type = "Income" if trans['type'] == 1 else "Expense"
+            
+            if trans['type'] == 0:
+                cat_name = expense_categories.get(trans['subtype'], f"Category {trans['subtype']}")
+            else:
+                cat_name = income_categories.get(trans['subtype'], f"Category {trans['subtype']}")
+            
+            symbol = "➕" if trans['type'] == 1 else "➖"
+            print(f"{i}. {symbol} {trans_type} - {cat_name}: ${trans['amount']:,.2f}")
+        
+        print(f"\n💰 Current Balance: ${current_budget:,.2f}")
+    
+    elif query_type == 'income_summary':
+        transactions = load_transactions()
+        incomes = [t for t in transactions if t['type'] == 1]
+        
+        if not incomes:
+            print("❌ No income recorded.")
+            return
+        
+        category_totals = defaultdict(float)
+        for inc in incomes:
+            category_totals[inc['subtype']] += inc['amount']
+        
+        total_income = sum(category_totals.values())
+        
+        print("\n" + "=" * 70)
+        print(f"💰 Total Income: ${total_income:,.2f}")
+        print("=" * 70)
+        print(f"💵 Current Balance: ${current_budget:,.2f}")
+        print("=" * 70)
+        print("\n📊 Income by Category:\n")
+        
+        for category_id in sorted(income_categories.keys()):
+            cat_name = income_categories[category_id]
+            amount = category_totals.get(category_id, 0)
+            
+            if amount > 0:
+                percentage = (amount / total_income) * 100
+                bar_length = int(percentage / 2)
+                bar = "█" * bar_length + "░" * (50 - bar_length)
+                print(f"{category_id}. {cat_name:25s} │{bar}│ {percentage:6.1f}% │ ${amount:>12,.2f}")
+            else:
+                print(f"{category_id}. {cat_name:25s} │{' ' * 50}│  0.0% │      $0.00")
+        
+        print("\n" + "=" * 70)
+        print(f"💰 Total Income: ${total_income:,.2f}")
+        print("=" * 70)
+    
+    elif query_type == 'expense_summary':
+        transactions = load_transactions()
+        expenses = [t for t in transactions if t['type'] == 0]
+        
+        if not expenses:
+            print("❌ No expenses recorded.")
+            return
+        
+        total = sum(exp['amount'] for exp in expenses)
+        print("\n" + "=" * 70)
+        print(f"💸 Total Expenses: ${total:,.2f}")
+        print("=" * 70)
+        print(f"💰 Current Balance: ${current_budget:,.2f}")
+        print("=" * 70)
+    
+    elif query_type == 'budget_status':
+        transactions = load_transactions()
+        total_income = sum(t['amount'] for t in transactions if t['type'] == 1)
+        total_expense = sum(t['amount'] for t in transactions if t['type'] == 0)
+        
+        print("\n" + "=" * 70)
+        print("💰 Budget Status:")
+        print("=" * 70)
+        print(f"   ➕ Total Income: ${total_income:,.2f}")
+        print(f"   ➖ Total Expenses: ${total_expense:,.2f}")
+        print(f"   💵 Current Balance: ${current_budget:,.2f}")
+        print("=" * 70)
+
+# Main loop
+print("🚀 Financial Management System Ready!")
+print("=" * 60)
+
+while True:
+    text = input("\n💬 Enter your financial text (empty Enter to exit): ").strip()
+    
+    if not text:
+        print("👋 Exiting program.")
+        break
+
+    # Send to model
+    response = ollama.chat(
+        model='qwen2.5:14b',
+        messages=[
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': text}
+        ]
+    )
+
+    output = response['message']['content'].strip()
+    
+    # Clean extra lines and numbering
+    lines = output.split('\n')
+    clean_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        # Remove empty lines
+        if not line:
+            continue
+        # Remove markdown lines
+        if line.startswith('```'):
+            continue
+        # Remove lines that are only number with period
+        if len(line) <= 3 and line.endswith('.') and line[:-1].isdigit():
+            continue
+        # Remove lines containing additional explanations
+        if not any(line.startswith(prefix) for prefix in ['query_type =', 'budget =', 'target ']):
+            if any(word in line.lower() for word in ['based on', 'output:', 'input', 'given', 'best', 'according', 'rules', 'format']):
+                continue
+            # If line contains "type =" and doesn't start with query_type, remove it
+            if 'type =' in line.lower() and not line.startswith('query_type ='):
+                continue
+        
+        clean_lines.append(line)
+    
+    # If no valid lines remain, error
+    if not clean_lines:
+        print("❌ Model output is invalid.")
+        print(f"🔍 Raw output: {output}")
+        print("=" * 60)
+        continue
+    
+    # Take only the first valid line
+    output = clean_lines[0]
+    lines = clean_lines
+
+    processed = False
+
+    # 1. Analytical question mode
+    if lines and lines[0].startswith("query_type ="):
+        try:
+            query_type = lines[0].split("=")[1].strip()
+            handle_query(query_type)
+            processed = True
+        except Exception as e:
+            print(f"❌ Error processing question: {e}")
+
+    # 2. Budget mode
+    elif lines and lines[0].startswith("budget ="):
+        try:
+            amount = float(lines[0].split("=")[1].strip())
+            current_budget = amount
+            save_state()
+            print(f"✅ Current budget updated: ${current_budget:,.2f}")
+            processed = True
+        except:
+            print("❌ Error processing budget.")
+
+    # 3. Financial goal mode
+    elif lines and len(lines) >= 2 and lines[0].startswith("target subject ="):
+        try:
+            subject = lines[0].split("=")[1].strip()
+            price = float(lines[1].split("=")[1].strip())
+            targets.append({'subject': subject, 'price': price})
+            save_state()
+            print(f"✅ New goal added: {subject} with price ${price:,.2f}")
+            print(f"📌 Current number of goals: {len(targets)}")
+            processed = True
+        except:
+            print("❌ Error processing financial goal.")
+
+    # 4. Financial transaction mode
+    if not processed:
+        # If output contains comma, we have multiple transactions
+        transactions = output.split(',')
+        
+        for trans in transactions:
+            trans = trans.strip()
+            fields = trans.split('.')
+            
+            if len(fields) == 3:
+                try:
+                    trans_type = int(fields[0])
+                    subtype = int(fields[1])
+                    amount = float(fields[2])
+
+                    # Save transaction in CSV
+                    with open(transactions_file, 'a', newline='', encoding='utf-8') as file:
+                        writer = csv.writer(file, delimiter=',')
+                        writer.writerow([trans_type, subtype, amount])
+
+                    # Update budget
+                    if trans_type == 1:  # Income
+                        current_budget += amount
+                        cat_name = income_categories.get(subtype, f'Category {subtype}')
+                        print(f"✅ Income recorded: {cat_name} - ${amount:,.2f}")
+                    elif trans_type == 0:  # Expense
+                        current_budget -= amount
+                        cat_name = expense_categories.get(subtype, f'Category {subtype}')
+                        print(f"✅ Expense recorded: {cat_name} - ${amount:,.2f}")
+
+                    save_state()
+                    print(f"💰 Current Balance: ${current_budget:,.2f}")
+                    processed = True
+
+                except ValueError:
+                    print("❌ Error processing transaction:", trans)
+            elif trans and not processed:
+                # If format is invalid and no transaction processed
+                print("⚠️ Invalid transaction format:", trans)
+        
+        # If no transaction was processed
+        if not processed:
+            print("❌ Model output cannot be processed.")
+            print(f"🔍 Received output: {output}")
+
+    print("=" * 60)
