@@ -9,7 +9,7 @@ system_prompt = """
 You are a financial analyst that converts English text related to financial matters into precise, structured numerical outputs.
 
 ⚠️ Important: Your output must be only one line. No explanations, no numbering, no additional text should exist.
-
+#thanks for yor attention 
 1. Content Type Recognition (Prioritization)
 Input text may contain one of the following:
 1. Analytical question (query about financial status, goals, transactions)
